@@ -176,7 +176,8 @@ body{background:var(--void);color:var(--ink);font-family:var(--sans);}
 <script>
 const CENTER=[48.08,7.55];
 const RADIUS_NM=150;
-const REFRESH_MS=8000;
+const REFRESH_MS=6000;   // vraies positions toutes les 6s ; l'interpolation lisse entre les deux
+const TRAIL_MAX=18;       // nb de points gardes pour la trainee
 const BOUNDS=[[47.50,7.15],[48.66,7.90]];
 
 const AIRPORTS=[
@@ -216,7 +217,9 @@ CITIES.forEach(c=>{
     `<div class="city-label" style="transform:translate(6px,-6px);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:#4f6478">&middot; ${c.name}</div>`})}).addTo(map);
 });
 
-const markers={};
+// ============ ETAT DES AVIONS (pour interpolation fluide facon Flightradar) ============
+// state[hex] = { ac, marker, trail(polyline), pts[], realLat, realLon, gs, track, fixTime, dispLat, dispLon }
+const state={};
 let militaryOnly=false, selectedHex=null;
 
 function planeSvg(color){
@@ -226,11 +229,20 @@ function planeSvg(color){
 function isMil(ac){return (ac.dbFlags&1)===1||ac.military===true;}
 function isEmg(ac){const s=ac.squawk;return s==='7500'||s==='7600'||s==='7700'||(ac.emergency&&ac.emergency!=='none');}
 function colorFor(ac){if(isEmg(ac))return '#ff3b5b';if(isMil(ac))return '#ffb020';return '#dce7f0';}
-function makeIcon(ac){
+function makeIcon(ac,hex){
   const trk=ac.track??ac.true_heading??0;
-  const sel=(ac.hex||'').toLowerCase()===selectedHex;
+  const sel=hex===selectedHex;
   return L.divIcon({className:'plane-icon',iconSize:[24,24],iconAnchor:[12,12],
     html:`<div style="transform:rotate(${trk}deg);${sel?'filter:drop-shadow(0 0 6px #22d3ee)':''}">${planeSvg(colorFor(ac))}</div>`});
+}
+
+// Projette une position en avant selon cap + distance (dead reckoning, formule haversine directe)
+function deadReckon(lat,lon,bearingDeg,distM){
+  const R=6371000, d=distM/R, th=bearingDeg*Math.PI/180;
+  const la=lat*Math.PI/180, lo=lon*Math.PI/180;
+  const la2=Math.asin(Math.sin(la)*Math.cos(d)+Math.cos(la)*Math.sin(d)*Math.cos(th));
+  const lo2=lo+Math.atan2(Math.sin(th)*Math.sin(d)*Math.cos(la),Math.cos(d)-Math.sin(la)*Math.sin(la2));
+  return [la2*180/Math.PI, lo2*180/Math.PI];
 }
 
 async function fetchSrc(url){try{const r=await fetch(url,{headers:{Accept:'application/json'}});if(!r.ok)return[];const j=await r.json();return j.ac||j.aircraft||[];}catch(e){return[];}}
@@ -242,25 +254,67 @@ async function refresh(){
   let planes=Object.values(merged).filter(a=>a.lat!=null&&a.lon!=null);
   if(planes.length===0){planes=DEMO();showToast('MODE DEMO - sources injoignables (CORS navigateur). Deploie le proxy Vercel /api/flights.');}
   else hideToast();
-  render(planes);
+  ingest(planes);
 }
 
-function render(planes){
+// Enregistre les VRAIES positions recues (met a jour l'ancre + la trainee)
+function ingest(planes){
   const seen=new Set();let shown=0,mil=0;
+  const now=performance.now();
   for(const ac of planes){
     const h=(ac.hex||'').toLowerCase();if(!h)continue;
     if(isMil(ac))mil++;
     if(militaryOnly&&!isMil(ac))continue;
     seen.add(h);shown++;
-    const pos=[ac.lat,ac.lon];
-    if(markers[h]){markers[h].setLatLng(pos);markers[h].setIcon(makeIcon(ac));markers[h]._ac=ac;}
-    else{const m=L.marker(pos,{icon:makeIcon(ac)}).addTo(map);m._ac=ac;m.on('click',()=>openPanel(m._ac));markers[h]=m;}
+    let st=state[h];
+    if(!st){
+      st=state[h]={ac,pts:[],dispLat:ac.lat,dispLon:ac.lon};
+      st.marker=L.marker([ac.lat,ac.lon],{icon:makeIcon(ac,h)}).addTo(map);
+      st.marker.on('click',()=>openPanel(state[h].ac));
+      st.trail=L.polyline([],{color:colorFor(ac),weight:1.5,opacity:0.35,smoothFactor:1}).addTo(map);
+    }
+    st.ac=ac;
+    st.realLat=ac.lat; st.realLon=ac.lon;
+    st.gs=ac.gs; st.track=ac.track??ac.true_heading??0;
+    st.fixTime=now;
+    st.marker.setIcon(makeIcon(ac,h));
+    // Ajout du point a la trainee (vraie position)
+    st.pts.push([ac.lat,ac.lon]);
+    if(st.pts.length>TRAIL_MAX)st.pts.shift();
+    st.trail.setLatLngs(st.pts);
+    st.trail.setStyle({color:colorFor(ac),opacity:h===selectedHex?0.7:0.3,weight:h===selectedHex?2.5:1.5});
   }
-  for(const h in markers)if(!seen.has(h)){map.removeLayer(markers[h]);delete markers[h];}
+  // Nettoyage des disparus
+  for(const h in state){
+    if(!seen.has(h)){map.removeLayer(state[h].marker);map.removeLayer(state[h].trail);delete state[h];}
+  }
   document.getElementById('cnt').textContent=shown;
   document.getElementById('cntMil').textContent=mil;
-  if(selectedHex&&markers[selectedHex])openPanel(markers[selectedHex]._ac,true);
+  if(selectedHex&&state[selectedHex])openPanel(state[selectedHex].ac,true);
 }
+
+// ============ BOUCLE D'ANIMATION : glissement fluide entre 2 vraies positions ============
+function animate(){
+  const now=performance.now();
+  for(const h in state){
+    const st=state[h];
+    let lat=st.realLat, lon=st.realLon;
+    const gs=st.gs; // noeuds
+    // Dead reckoning : on projette depuis la derniere vraie position selon le temps ecoule
+    if(gs&&gs>30&&st.ac.alt_baro!=='ground'){
+      let elapsed=(now-st.fixTime)/1000;        // secondes depuis le dernier fix
+      if(elapsed>30)elapsed=30;                  // securite : pas d'extrapolation folle
+      const distM=gs*0.514444*elapsed;           // kt -> m/s -> metres
+      [lat,lon]=deadReckon(st.realLat,st.realLon,st.track,distM);
+    }
+    // Lissage doux vers la position calculee (evite tout micro-saut)
+    st.dispLat+=(lat-st.dispLat)*0.25;
+    st.dispLon+=(lon-st.dispLon)*0.25;
+    st.marker.setLatLng([st.dispLat,st.dispLon]);
+  }
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
 
 // --- Photo avion : d'abord la vraie (planespotters par hex), sinon image du MODELE (Wikipedia) ---
 const photoCache={};
@@ -287,63 +341,99 @@ function renderPhoto(h,type,desc){
   loadModelImage(h,type,desc);
 }
 
-// --- Image generique du MODELE via Wikipedia (clairement etiquetee) ---
+// --- Image generique du MODELE : recherche Wikipedia par mots-cles (bien plus fiable) ---
 const modelCache={};
+function cleanModel(desc,type){
+  // "Airbus A320-214" -> "Airbus A320" ; garde une requete propre
+  let t=(desc||'').trim();
+  if(!t)t=(type||'').trim();
+  t=t.replace(/\s+/g,' ');
+  return t;
+}
 async function loadModelImage(h,type,desc){
   const box=document.getElementById('pPhoto');
-  const title=(desc||type||'').trim();
-  const searchUrl='https://commons.wikimedia.org/w/index.php?search='+encodeURIComponent((desc||type||'avion'))+'&title=Special:MediaSearch&type=image';
-  if(!title){box.innerHTML=`<div class="ph-ph">MODELE INCONNU<br><a class="ph-link" href="${searchUrl}" target="_blank" rel="noopener">Chercher des images</a></div>`;return;}
+  const q=cleanModel(desc,type);
+  const searchUrl='https://commons.wikimedia.org/w/index.php?search='+encodeURIComponent((q||'avion')+' aircraft')+'&title=Special:MediaSearch&type=image';
+  if(!q){box.innerHTML=`<div class="ph-ph">MODELE INCONNU<br><a class="ph-link" href="${searchUrl}" target="_blank" rel="noopener">Chercher des images</a></div>`;return;}
   box.innerHTML='<div class="ph-ph">RECHERCHE MODELE...</div>';
-  if(modelCache[title]!==undefined){renderModel(h,title,searchUrl);return;}
+  if(modelCache[q]!==undefined){renderModel(h,q,searchUrl);return;}
   let found=null;
+  // On interroge Wikipedia avec generator=search : il trouve la meilleure page ET son image en 1 appel
   for(const wiki of ['fr','en']){
+    if(found)break;
     try{
-      const r=await fetch(`https://${wiki}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title.replace(/ /g,'_'))}`);
-      if(!r.ok)continue;
+      const api=`https://${wiki}.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(q)}&gsrlimit=1&prop=pageimages|info&piprop=thumbnail&pithumbsize=500&inprop=url&format=json&origin=*`;
+      const r=await fetch(api);
       const j=await r.json();
-      if(j.thumbnail&&j.thumbnail.source){
-        found={url:j.thumbnail.source,page:(j.content_urls&&j.content_urls.desktop&&j.content_urls.desktop.page)||searchUrl};
-        break;
+      const pages=j&&j.query&&j.query.pages;
+      if(pages){
+        const pg=Object.values(pages)[0];
+        if(pg&&pg.thumbnail&&pg.thumbnail.source){
+          found={url:pg.thumbnail.source,page:pg.fullurl||searchUrl};
+        }
       }
     }catch(e){}
   }
-  modelCache[title]=found;
-  renderModel(h,title,searchUrl);
+  modelCache[q]=found;
+  renderModel(h,q,searchUrl);
 }
-function renderModel(h,title,searchUrl){
+function renderModel(h,q,searchUrl){
   const box=document.getElementById('pPhoto');
   if(selectedHex!==h)return;
-  const m=modelCache[title];
+  const m=modelCache[q];
   if(m){
-    box.innerHTML=`<img src="${m.url}" alt="modele ${title}"/>
-      <div class="ph-model">Modele ${title} — pas cet avion precis</div>
+    box.innerHTML=`<img src="${m.url}" alt="modele ${q}"/>
+      <div class="ph-model">Modele ${q} — image d'illustration, pas cet avion</div>
       <div class="ph-credit"><a class="ph-link" style="margin:0" href="${m.page}" target="_blank" rel="noopener">+ d'infos</a></div>`;
   }else{
-    box.innerHTML=`<div class="ph-ph">PAS DE PHOTO<br>DISPONIBLE<br><a class="ph-link" href="${searchUrl}" target="_blank" rel="noopener">Images du modele ${title}</a></div>`;
+    box.innerHTML=`<div class="ph-ph">PAS DE PHOTO<br><a class="ph-link" href="${searchUrl}" target="_blank" rel="noopener">Images du modele ${q}</a></div>`;
   }
 }
 
-// --- Route / plan de vol via adsbdb.com (par callsign) ---
+// --- Route / plan de vol : adsbdb.com en principal, adsb.lol en secours ---
 const routeCache={};
-async function loadRoute(callsign,hex){
+async function loadRoute(ac){
   const box=document.getElementById('pRoute');
-  const cs=(callsign||'').trim();
+  const cs=(ac.flight||'').trim();
+  const hex=ac.hex;
   box.innerHTML='<div class="rt-unknown">RECHERCHE ROUTE...</div>';
   if(!cs){box.innerHTML='<div class="rt-unknown">ROUTE INCONNUE (pas de callsign)</div>';return;}
   const key=cs.toUpperCase();
   if(routeCache[key]!==undefined){renderRoute(key,hex);return;}
+
+  let route=null;
+  // 1) adsbdb.com
   try{
     const r=await fetch(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(key)}`);
     const j=await r.json();
     const fr=j&&j.response&&j.response.flightroute;
     if(fr&&fr.origin&&fr.destination){
-      routeCache[key]={
+      route={
         o:{code:fr.origin.iata_code||fr.origin.icao_code,city:fr.origin.municipality||fr.origin.name||''},
         d:{code:fr.destination.iata_code||fr.destination.icao_code,city:fr.destination.municipality||fr.destination.name||''}
       };
-    }else routeCache[key]=null;
-  }catch(e){routeCache[key]=null;}
+    }
+  }catch(e){}
+  // 2) secours : adsb.lol routeset (POST callsign + position)
+  if(!route&&ac.lat!=null){
+    try{
+      const r=await fetch('https://api.adsb.lol/api/0/routeset',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({planes:[{callsign:key,lat:ac.lat,lng:ac.lon}]})
+      });
+      const j=await r.json();
+      const item=Array.isArray(j)?j[0]:null;
+      const aps=item&&item._airports;
+      if(aps&&aps.length>=2){
+        const o=aps[0],d=aps[aps.length-1];
+        route={
+          o:{code:o.iata||o.icao,city:o.municipality||o.name||''},
+          d:{code:d.iata||d.icao,city:d.municipality||d.name||''}
+        };
+      }
+    }catch(e){}
+  }
+  routeCache[key]=route;
   renderRoute(key,hex);
 }
 function renderRoute(key,hex){
@@ -387,7 +477,7 @@ function openPanel(ac,keep){
     ['Age signal',fmt(ac.seen!=null?ac.seen.toFixed(0):null,'s')],
   ];
   document.getElementById('pData').innerHTML=rows.map(([k,v,b])=>`<div class="drow"><span class="dk">${k}</span><span class="dv${b?' big':''}">${v}</span></div>`).join('');
-  if(!keep){document.getElementById('panel').classList.add('open');loadPhoto(ac.hex,ac.t,ac.desc);loadRoute(ac.flight,ac.hex);}
+  if(!keep){document.getElementById('panel').classList.add('open');loadPhoto(ac.hex,ac.t,ac.desc);loadRoute(ac);}
 }
 document.getElementById('pX').onclick=()=>{document.getElementById('panel').classList.remove('open');selectedHex=null;};
 
@@ -398,6 +488,14 @@ let tT;function showToast(m){const t=document.getElementById('toast');t.textCont
 function hideToast(){document.getElementById('toast').classList.remove('show');}
 
 function DEMO(){
+  // Routes de demo (les vrais avions se resolvent via adsbdb/adsb.lol en prod)
+  Object.assign(routeCache,{
+    'AFR47XK':{o:{code:'CDG',city:'Paris'},d:{code:'SXB',city:'Strasbourg'}},
+    'DLH9MK':{o:{code:'FRA',city:'Francfort'},d:{code:'ZRH',city:'Zurich'}},
+    'EZS81QP':{o:{code:'BSL',city:'Bale-Mulhouse'},d:{code:'LGW',city:'Londres'}},
+    'BER22H':{o:{code:'BER',city:'Berlin'},d:{code:'BSL',city:'Bale-Mulhouse'}},
+    'SWR6LX':{o:{code:'ZRH',city:'Zurich'},d:{code:'BSL',city:'Bale-Mulhouse'}},
+  });
   const b=[
     {hex:'3944ed',flight:'AFR47XK',r:'F-HEPK',t:'A320',desc:'Airbus A320',ownOp:'Air France',lat:48.55,lon:7.62,alt_baro:34000,gs:452,track:210,baro_rate:0,squawk:'1000',category:'A3',seen:1.2},
     {hex:'3c6674',flight:'DLH9MK',r:'D-AIRN',t:'A321',desc:'Airbus A321',ownOp:'Lufthansa',lat:47.72,lon:7.48,alt_baro:9250,gs:290,track:190,baro_rate:-1400,squawk:'2456',category:'A3',seen:0.8},
