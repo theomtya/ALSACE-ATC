@@ -75,10 +75,22 @@ body{background:var(--void);color:var(--ink);font-family:var(--sans);}
 .p-photo .ph-ph{color:var(--muted);font-family:var(--mono);font-size:10px;letter-spacing:2px;text-align:center;line-height:1.6;}
 .p-photo .ph-credit{position:absolute;bottom:0;left:0;right:0;font-family:var(--mono);font-size:8px;
   color:var(--ink-2);background:linear-gradient(0deg,rgba(6,10,16,0.85),transparent);padding:8px 8px 4px;text-align:right;}
+.p-photo .ph-model{position:absolute;top:0;left:0;right:0;font-family:var(--mono);font-size:8px;letter-spacing:1px;
+  color:#0b131e;background:var(--amber);padding:4px 8px;text-align:center;font-weight:700;text-transform:uppercase;}
+.p-photo .ph-link{margin-top:8px;display:inline-block;font-family:var(--mono);font-size:9px;letter-spacing:1px;
+  color:var(--cyan);text-decoration:none;border:1px solid var(--cyan-dim);border-radius:4px;padding:5px 10px;}
+.p-photo .ph-link:hover{background:rgba(34,211,238,0.1);}
 .p-eyebrow{font-family:var(--mono);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--cyan);}
 .p-call{font-family:var(--mono);font-size:32px;font-weight:700;letter-spacing:1px;color:var(--ink);margin-top:6px;line-height:1;}
 .p-type{font-size:13px;color:var(--ink-2);margin-top:6px;}
 .p-tags{margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;}
+.p-route{margin-top:14px;padding-top:14px;border-top:1px solid var(--line);font-family:var(--mono);}
+.p-route .rt-line{display:flex;align-items:center;justify-content:space-between;gap:8px;}
+.p-route .rt-ap{flex:1;text-align:center;}
+.p-route .rt-code{font-size:20px;font-weight:700;color:var(--cyan);letter-spacing:1px;}
+.p-route .rt-city{font-size:9px;color:var(--ink-2);margin-top:3px;letter-spacing:1px;text-transform:uppercase;line-height:1.3;}
+.p-route .rt-arrow{color:var(--amber);font-size:16px;flex:0 0 auto;}
+.p-route .rt-unknown{font-size:10px;color:var(--muted);letter-spacing:2px;text-align:center;}
 .tag{font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;padding:3px 9px;border-radius:3px;}
 .tag.mil{background:var(--amber);color:#0b131e;}
 .tag.emg{background:var(--red);color:#fff;animation:blink 1s infinite;}
@@ -153,6 +165,7 @@ body{background:var(--void);color:var(--ink);font-family:var(--sans);}
     <div class="p-call" id="pCall">&mdash;</div>
     <div class="p-type" id="pType">&mdash;</div>
     <div class="p-tags" id="pTags"></div>
+    <div class="p-route" id="pRoute"><div class="rt-unknown">...</div></div>
   </div>
   <div class="data" id="pData"></div>
   <div class="p-note">Position agr&eacute;g&eacute;e depuis les r&eacute;seaux communautaires ADS-B non censur&eacute;s (adsb.lol &middot; airplanes.live &middot; adsb.fi). Champs vides = non &eacute;mis par l'appareil.</div>
@@ -249,28 +262,101 @@ function render(planes){
   if(selectedHex&&markers[selectedHex])openPanel(markers[selectedHex]._ac,true);
 }
 
-// --- Photo avion via planespotters (gratuit, par code hex) ---
+// --- Photo avion : d'abord la vraie (planespotters par hex), sinon image du MODELE (Wikipedia) ---
 const photoCache={};
-async function loadPhoto(hex){
+async function loadPhoto(hex,type,desc){
   const box=document.getElementById('pPhoto');
   const h=(hex||'').toLowerCase();
   box.innerHTML='<div class="ph-ph">CHARGEMENT...</div>';
   if(!h){box.innerHTML='<div class="ph-ph">PAS DE PHOTO</div>';return;}
-  if(photoCache[h]!==undefined){renderPhoto(h);return;}
+  if(photoCache[h]!==undefined){renderPhoto(h,type,desc);return;}
   try{
     const r=await fetch(`https://api.planespotters.net/pub/photos/hex/${h}`);
     const j=await r.json();
     const ph=(j.photos&&j.photos[0])||null;
     photoCache[h]=ph?{url:(ph.thumbnail_large&&ph.thumbnail_large.src)||ph.thumbnail.src,by:ph.photographer||'planespotters'}:null;
   }catch(e){photoCache[h]=null;}
-  renderPhoto(h);
+  renderPhoto(h,type,desc);
 }
-function renderPhoto(h){
+function renderPhoto(h,type,desc){
   const box=document.getElementById('pPhoto');
-  if(selectedHex!==h)return; // l'utilisateur a change d'avion entre-temps
+  if(selectedHex!==h)return;
   const ph=photoCache[h];
-  if(ph)box.innerHTML=`<img src="${ph.url}" alt="avion"/><div class="ph-credit">© ${ph.by} · planespotters.net</div>`;
-  else box.innerHTML='<div class="ph-ph">PAS DE PHOTO<br>DISPONIBLE</div>';
+  if(ph){box.innerHTML=`<img src="${ph.url}" alt="avion"/><div class="ph-credit">© ${ph.by} · planespotters.net</div>`;return;}
+  // Pas de photo reelle -> on tente une image du modele
+  loadModelImage(h,type,desc);
+}
+
+// --- Image generique du MODELE via Wikipedia (clairement etiquetee) ---
+const modelCache={};
+async function loadModelImage(h,type,desc){
+  const box=document.getElementById('pPhoto');
+  const title=(desc||type||'').trim();
+  const searchUrl='https://commons.wikimedia.org/w/index.php?search='+encodeURIComponent((desc||type||'avion'))+'&title=Special:MediaSearch&type=image';
+  if(!title){box.innerHTML=`<div class="ph-ph">MODELE INCONNU<br><a class="ph-link" href="${searchUrl}" target="_blank" rel="noopener">Chercher des images</a></div>`;return;}
+  box.innerHTML='<div class="ph-ph">RECHERCHE MODELE...</div>';
+  if(modelCache[title]!==undefined){renderModel(h,title,searchUrl);return;}
+  let found=null;
+  for(const wiki of ['fr','en']){
+    try{
+      const r=await fetch(`https://${wiki}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title.replace(/ /g,'_'))}`);
+      if(!r.ok)continue;
+      const j=await r.json();
+      if(j.thumbnail&&j.thumbnail.source){
+        found={url:j.thumbnail.source,page:(j.content_urls&&j.content_urls.desktop&&j.content_urls.desktop.page)||searchUrl};
+        break;
+      }
+    }catch(e){}
+  }
+  modelCache[title]=found;
+  renderModel(h,title,searchUrl);
+}
+function renderModel(h,title,searchUrl){
+  const box=document.getElementById('pPhoto');
+  if(selectedHex!==h)return;
+  const m=modelCache[title];
+  if(m){
+    box.innerHTML=`<img src="${m.url}" alt="modele ${title}"/>
+      <div class="ph-model">Modele ${title} — pas cet avion precis</div>
+      <div class="ph-credit"><a class="ph-link" style="margin:0" href="${m.page}" target="_blank" rel="noopener">+ d'infos</a></div>`;
+  }else{
+    box.innerHTML=`<div class="ph-ph">PAS DE PHOTO<br>DISPONIBLE<br><a class="ph-link" href="${searchUrl}" target="_blank" rel="noopener">Images du modele ${title}</a></div>`;
+  }
+}
+
+// --- Route / plan de vol via adsbdb.com (par callsign) ---
+const routeCache={};
+async function loadRoute(callsign,hex){
+  const box=document.getElementById('pRoute');
+  const cs=(callsign||'').trim();
+  box.innerHTML='<div class="rt-unknown">RECHERCHE ROUTE...</div>';
+  if(!cs){box.innerHTML='<div class="rt-unknown">ROUTE INCONNUE (pas de callsign)</div>';return;}
+  const key=cs.toUpperCase();
+  if(routeCache[key]!==undefined){renderRoute(key,hex);return;}
+  try{
+    const r=await fetch(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(key)}`);
+    const j=await r.json();
+    const fr=j&&j.response&&j.response.flightroute;
+    if(fr&&fr.origin&&fr.destination){
+      routeCache[key]={
+        o:{code:fr.origin.iata_code||fr.origin.icao_code,city:fr.origin.municipality||fr.origin.name||''},
+        d:{code:fr.destination.iata_code||fr.destination.icao_code,city:fr.destination.municipality||fr.destination.name||''}
+      };
+    }else routeCache[key]=null;
+  }catch(e){routeCache[key]=null;}
+  renderRoute(key,hex);
+}
+function renderRoute(key,hex){
+  const box=document.getElementById('pRoute');
+  if((hex||'').toLowerCase()!==selectedHex)return;
+  const rt=routeCache[key];
+  if(rt){
+    box.innerHTML=`<div class="rt-line">
+      <div class="rt-ap"><div class="rt-code">${rt.o.code||'?'}</div><div class="rt-city">${rt.o.city}</div></div>
+      <div class="rt-arrow">&#10230;</div>
+      <div class="rt-ap"><div class="rt-code">${rt.d.code||'?'}</div><div class="rt-city">${rt.d.city}</div></div>
+    </div>`;
+  }else box.innerHTML='<div class="rt-unknown">ROUTE INCONNUE (vol prive / militaire / non repertorie)</div>';
 }
 
 function fmt(v,u=''){return (v==null||v==='')?'&mdash;':(v+(u?`<span class="u">${u}</span>`:''));}
@@ -285,19 +371,23 @@ function openPanel(ac,keep){
   else if(s==='7600')tags+='<span class="tag emg">RADIO 7600</span>';
   else if(s==='7500')tags+='<span class="tag emg">HIJACK 7500</span>';
   document.getElementById('pTags').innerHTML=tags;
+  // Conversions : ft->m (x0.3048), kt->km/h (x1.852), ft/min->m/min (x0.3048)
+  const altM = (ac.alt_baro==null||ac.alt_baro==='ground')?null:Math.round(ac.alt_baro*0.3048);
+  const spdKmh = ac.gs!=null?Math.round(ac.gs*1.852):null;
+  const vsMmin = ac.baro_rate!=null?Math.round(ac.baro_rate*0.3048):null;
   const rows=[
     ['Immat',fmt(ac.r)],['ICAO hex',fmt((ac.hex||'').toUpperCase())],
-    ['Altitude',ac.alt_baro==='ground'?'AU SOL':fmt(ac.alt_baro,'ft'),true],
-    ['Vitesse sol',fmt(ac.gs?Math.round(ac.gs):null,'kt')],
+    ['Altitude',ac.alt_baro==='ground'?'AU SOL':fmt(altM,'m'),true],
+    ['Vitesse sol',fmt(spdKmh,'km/h')],
     ['Cap',fmt(ac.track?Math.round(ac.track):null,'deg')],
-    ['V/S',fmt(ac.baro_rate,'ft/min')],
+    ['V. verticale',fmt(vsMmin,'m/min')],
     ['Squawk',fmt(ac.squawk)],['Categorie',fmt(ac.category)],
     ['Operateur',fmt(ac.ownOp)],
     ['Position',ac.mlat&&ac.mlat.length?'MLAT':'ADS-B'],
     ['Age signal',fmt(ac.seen!=null?ac.seen.toFixed(0):null,'s')],
   ];
   document.getElementById('pData').innerHTML=rows.map(([k,v,b])=>`<div class="drow"><span class="dk">${k}</span><span class="dv${b?' big':''}">${v}</span></div>`).join('');
-  if(!keep){document.getElementById('panel').classList.add('open');loadPhoto(ac.hex);}
+  if(!keep){document.getElementById('panel').classList.add('open');loadPhoto(ac.hex,ac.t,ac.desc);loadRoute(ac.flight,ac.hex);}
 }
 document.getElementById('pX').onclick=()=>{document.getElementById('panel').classList.remove('open');selectedHex=null;};
 
