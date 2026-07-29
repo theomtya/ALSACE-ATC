@@ -172,7 +172,7 @@ body{background:var(--void);color:var(--ink);font-family:var(--sans);}
 </div>
 
 <div class="toast" id="toast"></div>
-<div style="position:fixed;bottom:18px;right:70px;z-index:1000;font-family:ui-monospace,monospace;font-size:9px;letter-spacing:2px;color:#22d3ee;background:rgba(6,10,16,0.85);border:1px solid #0e7490;border-radius:5px;padding:5px 10px;">BUILD v3.0</div>
+<div style="position:fixed;bottom:18px;right:70px;z-index:1000;font-family:ui-monospace,monospace;font-size:9px;letter-spacing:2px;color:#22d3ee;background:rgba(6,10,16,0.85);border:1px solid #0e7490;border-radius:5px;padding:5px 10px;">BUILD v3.1</div>
 
 <script>
 const CENTER=[48.08,7.55];
@@ -223,18 +223,38 @@ CITIES.forEach(c=>{
 const state={};
 let militaryOnly=false, selectedHex=null;
 
-function planeSvg(color){
-  return `<svg width="24" height="24" viewBox="0 0 24 24"><path fill="${color}" stroke="#060a10" stroke-width="0.7"
+function planeSvg(color,sz){
+  const s=sz||24;
+  return `<svg width="${s}" height="${s}" viewBox="0 0 24 24"><path fill="${color}" stroke="#060a10" stroke-width="0.7"
     d="M12 2 L13 9 L22 13 L22 15 L13 13.5 L12.8 20 L16 22 L16 23 L12 21.8 L8 23 L8 22 L11.2 20 L11 13.5 L2 15 L2 13 L11 9 Z"/></svg>`;
 }
 function isMil(ac){return (ac.dbFlags&1)===1||ac.military===true;}
 function isEmg(ac){const s=ac.squawk;return s==='7500'||s==='7600'||s==='7700'||(ac.emergency&&ac.emergency!=='none');}
 function colorFor(ac){if(isEmg(ac))return '#ff3b5b';if(isMil(ac))return '#ffb020';return '#dce7f0';}
+
+// Taille de l'icone selon le gabarit de l'appareil (categorie ADS-B A1->A5)
+function sizeFor(ac){
+  const c=(ac.category||'').toUpperCase();
+  if(c==='A1')return 16;   // leger (Cessna, petit prive)
+  if(c==='A2')return 20;   // petit
+  if(c==='A3')return 26;   // moyen (A320, B737)
+  if(c==='A4')return 32;   // gros
+  if(c==='A5')return 38;   // tres gros porteur (A380, B747)
+  if(c==='A7'||c==='B2')return 22; // helicoptere / rotorcraft
+  // Pas de categorie : on devine via le type
+  const t=(ac.t||'').toUpperCase();
+  if(/^(A38|B74|B77|A35|A34|B78|MD11|A33)/.test(t))return 36;   // gros porteurs
+  if(/^(A32|A31|B73|B71|E19|E29|BCS|CRJ|A22)/.test(t))return 26; // moyens courants
+  if(/^(C1|C2|C3|C4|C5|C6|C7|C8|DA4|DA6|PA|SR2|TBM|BE)/.test(t))return 16; // aviation legere
+  return 24; // defaut
+}
+
 function makeIcon(ac,hex){
   const trk=ac.track??ac.true_heading??0;
   const sel=hex===selectedHex;
-  return L.divIcon({className:'plane-icon',iconSize:[24,24],iconAnchor:[12,12],
-    html:`<div style="transform:rotate(${trk}deg);${sel?'filter:drop-shadow(0 0 6px #22d3ee)':''}">${planeSvg(colorFor(ac))}</div>`});
+  const sz=sizeFor(ac)*(sel?1.2:1);   // legerement plus gros si selectionne
+  return L.divIcon({className:'plane-icon',iconSize:[sz,sz],iconAnchor:[sz/2,sz/2],
+    html:`<div style="transform:rotate(${trk}deg);${sel?'filter:drop-shadow(0 0 7px #22d3ee)':''}">${planeSvg(colorFor(ac),sz)}</div>`});
 }
 
 // Projette une position en avant selon cap + distance (dead reckoning, formule haversine directe)
@@ -272,18 +292,19 @@ function ingest(planes){
       st=state[h]={ac,pts:[],dispLat:ac.lat,dispLon:ac.lon};
       st.marker=L.marker([ac.lat,ac.lon],{icon:makeIcon(ac,h)}).addTo(map);
       st.marker.on('click',()=>openPanel(state[h].ac));
-      st.trail=L.polyline([],{color:colorFor(ac),weight:1.5,opacity:0.35,smoothFactor:1}).addTo(map);
+      // Trainee creee mais PAS ajoutee a la carte : affichee seulement au clic
+      st.trail=L.polyline([],{color:'#22d3ee',weight:3,opacity:0.85,smoothFactor:1});
     }
     st.ac=ac;
     st.realLat=ac.lat; st.realLon=ac.lon;
     st.gs=ac.gs; st.track=ac.track??ac.true_heading??0;
     st.fixTime=now;
     st.marker.setIcon(makeIcon(ac,h));
-    // Ajout du point a la trainee (vraie position)
+    // On accumule l'historique des positions pour TOUS (pour pouvoir tracer au clic)
     st.pts.push([ac.lat,ac.lon]);
     if(st.pts.length>TRAIL_MAX)st.pts.shift();
-    st.trail.setLatLngs(st.pts);
-    st.trail.setStyle({color:colorFor(ac),opacity:h===selectedHex?0.7:0.3,weight:h===selectedHex?2.5:1.5});
+    // Si c'est l'avion selectionne, on met a jour sa trainee visible
+    if(h===selectedHex)st.trail.setLatLngs(st.pts);
   }
   // Nettoyage des disparus
   for(const h in state){
@@ -451,8 +472,25 @@ function renderRoute(key,hex){
 }
 
 function fmt(v,u=''){return (v==null||v==='')?'&mdash;':(v+(u?`<span class="u">${u}</span>`:''));}
+
+// Affiche la trainee du seul avion selectionne, retire toutes les autres
+function updateTrails(){
+  for(const h in state){
+    const st=state[h];
+    if(h===selectedHex){
+      st.trail.setLatLngs(st.pts);
+      if(!map.hasLayer(st.trail))st.trail.addTo(map);
+      st.marker.setIcon(makeIcon(st.ac,h)); // agrandit + glow le selectionne
+    }else{
+      if(map.hasLayer(st.trail))map.removeLayer(st.trail);
+    }
+  }
+}
+
 function openPanel(ac,keep){
+  const prev=selectedHex;
   selectedHex=(ac.hex||'').toLowerCase();
+  if(prev!==selectedHex){updateTrails(); if(prev&&state[prev])state[prev].marker.setIcon(makeIcon(state[prev].ac,prev));}
   document.getElementById('pCall').textContent=(ac.flight||ac.r||ac.hex||'-').trim();
   document.getElementById('pType').textContent=[ac.t,ac.desc].filter(Boolean).join(' - ')||'Type inconnu';
   let tags='';
@@ -480,7 +518,11 @@ function openPanel(ac,keep){
   document.getElementById('pData').innerHTML=rows.map(([k,v,b])=>`<div class="drow"><span class="dk">${k}</span><span class="dv${b?' big':''}">${v}</span></div>`).join('');
   if(!keep){document.getElementById('panel').classList.add('open');loadPhoto(ac.hex,ac.t,ac.desc);loadRoute(ac);}
 }
-document.getElementById('pX').onclick=()=>{document.getElementById('panel').classList.remove('open');selectedHex=null;};
+document.getElementById('pX').onclick=()=>{
+  document.getElementById('panel').classList.remove('open');
+  const prev=selectedHex; selectedHex=null;
+  if(prev&&state[prev]){map.removeLayer(state[prev].trail);state[prev].marker.setIcon(makeIcon(state[prev].ac,prev));}
+};
 
 document.getElementById('milBtn').onclick=function(){militaryOnly=!militaryOnly;this.classList.toggle('active',militaryOnly);refresh();};
 setInterval(()=>{document.getElementById('clock').textContent=new Date().toISOString().substr(11,8)+'Z';},1000);
